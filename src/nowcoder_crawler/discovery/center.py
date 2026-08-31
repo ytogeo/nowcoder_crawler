@@ -24,6 +24,7 @@ DEFAULT_HEADERS = {
 }
 
 
+# 面经中心 API 查询参数封装
 @dataclass(frozen=True)
 class CenterQuery:
     company_ids: tuple[int, ...] = ()
@@ -33,6 +34,7 @@ class CenterQuery:
 
     @property
     def source_key(self) -> str:
+        """生成唯一标识该查询条件的 source_key，用于 page_sources 区分来源。"""
         company_part = ",".join(str(value) for value in sorted(self.company_ids))
         return f"center:{company_part}:{self.job_id}:{self.level}"
 
@@ -44,6 +46,8 @@ class CenterStats:
 
 
 class CenterStopTracker:
+    """早期停止（Early Stop）跟踪器：连续 N 页无新发现或内容更新时提前终止翻页。"""
+
     def __init__(self, stale_pages: int) -> None:
         if stale_pages < 1:
             raise ValueError("stale_pages must be positive")
@@ -51,11 +55,13 @@ class CenterStopTracker:
         self.consecutive_stale = 0
 
     def observe(self, new_or_updated: int) -> bool:
+        """观察当前页是否有新增或更新页面，返回是否达到停止上限。"""
         self.consecutive_stale = 0 if new_or_updated else self.consecutive_stale + 1
         return self.consecutive_stale >= self.limit
 
 
 def _from_millis(value: object) -> datetime | None:
+    """将毫秒时间戳转换为 UTC datetime。"""
     if value is None:
         return None
     try:
@@ -65,6 +71,7 @@ def _from_millis(value: object) -> datetime | None:
 
 
 def parse_record(record: dict, query: CenterQuery, page_number: int) -> DiscoveredPage | None:
+    """解析单条 API 面经记录，提取页面身份与修改时间。"""
     identity = identity_from_center_record(record)
     if identity is None:
         return None
@@ -90,6 +97,7 @@ def parse_record(record: dict, query: CenterQuery, page_number: int) -> Discover
 async def fetch_center_page(
     client: httpx.AsyncClient, query: CenterQuery, page_number: int
 ) -> dict:
+    """发送 POST 请求拉取面经中心指定页码的 JSON 数据。"""
     payload = {
         "companyList": list(query.company_ids),
         "jobId": query.job_id,
@@ -121,24 +129,30 @@ async def discover_center(
     stale_pages: int,
     on_page: Callable[[int, list[DiscoveredPage]], Awaitable[int]],
 ) -> CenterStats:
+    """面经中心发现器：从第 1 页开始分页请求，直到满足最大页数、尾页或触发 Early Stop。"""
     if max_pages < 1:
         raise ValueError("max_pages must be positive")
     tracker = CenterStopTracker(stale_pages)
     pages_seen = 0
     urls_seen = 0
     for page_number in range(1, max_pages + 1):
+        # 1. 获取分页数据
         data = await fetch_center_page(client, query, page_number)
         pages_seen += 1
         records = data.get("records") or []
+        # 2. 批量解析有效页面
         discovered = [
             parsed
             for record in records
             if (parsed := parse_record(record, query, page_number)) is not None
         ]
         urls_seen += len(discovered)
+        # 3. 回调上游进行 Upsert，并获取本次活跃变更数量
         activity = await on_page(page_number, discovered)
+        # 4. 判断是否提前终止（无记录或连续 N 页无新增/变更）
         if not records or tracker.observe(activity):
             break
+        # 5. 到达接口声明的末页则退出
         total_pages = int(data.get("totalPage") or 0)
         if total_pages and page_number >= total_pages:
             break

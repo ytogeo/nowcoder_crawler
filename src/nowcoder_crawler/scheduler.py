@@ -19,6 +19,7 @@ from .rabbit import RabbitPublisher
 LOGGER = logging.getLogger("nowcoder_crawler.scheduler")
 
 
+# 记录单次调度运行（crawl_run）的统计计数器
 @dataclass
 class RunCounters:
     center_pages_seen: int = 0
@@ -30,6 +31,7 @@ class RunCounters:
 
 
 def _later(left: datetime | None, right: datetime | None) -> datetime | None:
+    """返回两个时间戳中较晚的一个。"""
     if left is None:
         return right
     if right is None:
@@ -43,10 +45,15 @@ def upsert_discovered_pages(
     discovered: list[DiscoveredPage],
     counters: RunCounters,
 ) -> int:
+    """批量更新/插入发现的页面，并维护来源血缘关系。
+
+    返回 activity（本次新增或发生内容变更的页面数），供上游发现器进行早期停止（Early Stop）判断。
+    """
     now = utc_now()
     activity = 0
     for item in discovered:
         identity = item.identity
+        # 1. 查询 pages 主表是否存在该页面
         page = session.scalar(
             select(Page).where(
                 Page.page_type == identity.page_type,
@@ -55,6 +62,7 @@ def upsert_discovered_pages(
         )
         is_new = page is None
         if page is None:
+            # 新发现页面：初始状态为 pending
             page = Page(
                 page_type=identity.page_type,
                 external_id=identity.external_id,
@@ -69,6 +77,7 @@ def upsert_discovered_pages(
             counters.pages_inserted += 1
             activity += 1
         else:
+            # 已存在页面：刷新最后可见时间与源站修改时间
             page.last_seen_at = now
             previous_modified = page.source_modified_at
             page.source_modified_at = _later(previous_modified, item.source_modified_at)
@@ -76,6 +85,7 @@ def upsert_discovered_pages(
                 previous_modified is None or item.source_modified_at > previous_modified
             ):
                 activity += 1
+                # 若源站更新时间晚于上次成功抓取时间，重置为 pending 触发重新抓取
                 if (
                     page.status == "success"
                     and page.last_fetched_at is not None
@@ -86,6 +96,7 @@ def upsert_discovered_pages(
                     page.last_error_message = None
             counters.pages_updated += 1
 
+        # 2. 记录/更新页面来源血缘（page_sources）
         source = session.scalar(
             select(PageSource).where(
                 PageSource.page_id == page.id,
@@ -130,6 +141,7 @@ def upsert_discovered_pages(
 async def _publish_candidates(
     database: Database, publisher: RabbitPublisher, counters: RunCounters
 ) -> None:
+    """筛选待抓取的页面（pending 或可重试的 failed），发布到 RabbitMQ 队列。"""
     with database.session() as session:
         candidates = list(
             session.scalars(
@@ -144,6 +156,7 @@ async def _publish_candidates(
     for page in candidates:
         await publisher.publish_page(page.id)
         counters.messages_published += 1
+        # 发布后将 retryable 的失败状态重置回 pending
         if page.status == "failed":
             with database.session() as session:
                 current = session.get(Page, page.id)
@@ -157,12 +170,15 @@ async def _publish_candidates(
 
 
 async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pages: int) -> int:
+    """调度器主入口：一次性执行发现、Upsert 数据库和发布抓取任务。"""
     invalid = set(sources) - {"center", "sitemap"}
     if invalid:
         raise ValueError(f"unsupported sources: {sorted(invalid)}")
     database = Database(settings.mysql_dsn)
     database.create_schema()
     counters = RunCounters()
+
+    # 1. 创建本次 crawl_runs 运行记录
     with database.session() as session:
         run = CrawlRun(status="running", sources_json=list(sources), started_at=utc_now())
         session.add(run)
@@ -176,6 +192,7 @@ async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pag
             connect=settings.fetch_connect_timeout_seconds,
         )
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            # 2-1. 面经中心 API 增量发现
             if "center" in sources:
 
                 async def on_center_page(page_number: int, pages: list[DiscoveredPage]) -> int:
@@ -192,6 +209,7 @@ async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pag
                 )
                 counters.center_pages_seen = center_stats.pages_seen
 
+            # 2-2. Sitemap 递归增量发现
             if "sitemap" in sources:
 
                 async def on_sitemap_pages(pages: list[DiscoveredPage]) -> int:
@@ -207,8 +225,11 @@ async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pag
                 )
                 counters.sitemap_docs_seen = sitemap_stats.documents_seen
 
+        # 3. 连接 RabbitMQ 并将待抓取候选页面推入队列
         publisher = await RabbitPublisher.connect(settings.rabbitmq_url, settings.fetch_queue)
         await _publish_candidates(database, publisher, counters)
+
+        # 4. 统计指标并标记本次运行为 success
         with database.session() as session:
             run = session.get(CrawlRun, run_id)
             assert run is not None
@@ -230,6 +251,7 @@ async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pag
         )
         return run_id
     except Exception as exc:
+        # 异常时记录错误信息并将 crawl_runs 标记为 failed
         with database.session() as session:
             run = session.get(CrawlRun, run_id)
             if run is not None:

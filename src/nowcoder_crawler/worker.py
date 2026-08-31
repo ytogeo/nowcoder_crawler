@@ -25,6 +25,7 @@ LOGGER = logging.getLogger("nowcoder_crawler.worker")
 async def _record_attempt(
     database: Database, page_id: int, worker_id: str, observation: AttemptObservation
 ) -> None:
+    """写入单次 HTTP 尝试的详细审计记录到 fetch_attempts 表。"""
     with database.session() as session:
         session.add(
             FetchAttempt(
@@ -55,6 +56,16 @@ async def handle_message(
     pacer: RequestPacer,
     fetch_state: WorkerFetchState,
 ) -> bool:
+    """处理单条 RabbitMQ 消息的核心流水线：
+
+    1. 解析消息与幂等检查；
+    2. 执行 HTTP 抓取与进程内重试；
+    3. 成功时原子写盘 gzip 并提交数据库；
+    4. 数据库提交后手动发送 ACK；
+
+    返回布尔值指示 Worker 是否应当退出（例如命中风控 blocked）。
+    """
+    # 1. 反序列化消息内容
     try:
         page_id = decode_page_message(message.body)
     except ValueError:
@@ -62,12 +73,14 @@ async def handle_message(
         await message.ack()
         return False
 
+    # 2. 消费前置幂等检查
     with database.session() as session:
         page = session.get(Page, page_id)
         if page is None:
             LOGGER.error("missing_page worker_id=%s page_id=%s", worker_id, page_id)
             await message.ack()
             return False
+        # 若之前已抓取成功（如 ACK 丢失导致的重投递），直接 ACK 跳过
         if page.status == "success":
             LOGGER.info("duplicate_success_ack worker_id=%s page_id=%s", worker_id, page_id)
             await message.ack()
@@ -88,6 +101,7 @@ async def handle_message(
             observation.elapsed_ms,
         )
 
+    # 3. 发起带节奏控制和重试机制的 HTTP 抓取
     outcome = await fetch_with_retry(
         client,
         identity=identity,
@@ -96,9 +110,13 @@ async def handle_message(
         state=fetch_state,
         on_attempt=on_attempt,
     )
+
+    # 4. 抓取成功分支：原子落盘 -> DB 提交 -> 手动 ACK
     if outcome.success:
         assert outcome.body is not None
+        # 4-1. 临时文件 + os.replace 原子写入 gzip
         stored = write_gzip_atomic(settings.raw_data_dir, identity, outcome.body)
+        # 4-2. 提交页面元数据与状态变更
         with database.session() as session:
             page = session.get(Page, page_id)
             if page is None:
@@ -121,10 +139,12 @@ async def handle_message(
         )
         if settings.failpoint_after_success_commit:
             raise RuntimeError("FAILPOINT_AFTER_SUCCESS_COMMIT")
+        # 4-3. 确认消息已处理完毕
         await message.ack()
         LOGGER.info("message_acked worker_id=%s page_id=%s result=success", worker_id, page_id)
         return False
 
+    # 5. 抓取失败分支：记录错误信息 -> 手动 ACK
     with database.session() as session:
         page = session.get(Page, page_id)
         if page is None:
@@ -145,12 +165,15 @@ async def handle_message(
 
 
 async def run_worker(settings: Settings, *, worker_id: str) -> int:
+    """Worker 守护进程入口：建立 RabbitMQ 消费连接与 QoS，开始并发处理任务。"""
     database = Database(settings.mysql_dsn)
     database.create_schema()
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
     channel = await connection.channel()
+    # 设置 prefetch 控制每个 Worker 未确认消息的预取上限
     await channel.set_qos(prefetch_count=settings.worker_prefetch)
     queue = await channel.declare_queue(settings.fetch_queue, durable=True)
+    # 初始化请求限速器与状态跟踪
     pacer = RequestPacer(settings.fetch_base_delay_seconds, settings.fetch_jitter_seconds)
     fetch_state = WorkerFetchState()
     timeout = httpx.Timeout(
@@ -178,6 +201,7 @@ async def run_worker(settings: Settings, *, worker_id: str) -> int:
                         pacer=pacer,
                         fetch_state=fetch_state,
                     )
+                    # 连续 429 或触发风控时主动退出，保护 IP
                     if should_exit:
                         LOGGER.error("worker_blocked_exit worker_id=%s", worker_id)
                         return 2
