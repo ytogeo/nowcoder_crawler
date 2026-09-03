@@ -29,3 +29,12 @@ def test_experience_api_max_pages_supports_legacy_name(
     monkeypatch.setenv("CENTER_MAX_PAGES", "17")
 
     assert Settings.from_env().experience_api_max_pages == 17
+
+
+def test_discovery_capacity_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _required_env(monkeypatch, tmp_path)
+
+    settings = Settings.from_env()
+
+    assert settings.discovery_queue_maxsize == 1000
+    assert settings.discovery_db_batch_size == 200

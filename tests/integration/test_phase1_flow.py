@@ -9,11 +9,12 @@ from sqlalchemy import func, select
 from nowcoder_crawler.config import Settings
 from nowcoder_crawler.database import Database
 from nowcoder_crawler.discovery import DiscoveredPage
+from nowcoder_crawler.discovery.writer import write_discovered_batch
 from nowcoder_crawler.fetcher import RequestPacer, WorkerFetchState
 from nowcoder_crawler.identity import build_identity
 from nowcoder_crawler.models import CrawlRun, Page, PageSource, utc_now
 from nowcoder_crawler.rabbit import encode_page_message
-from nowcoder_crawler.scheduler import RunCounters, _publish_candidates, upsert_discovered_pages
+from nowcoder_crawler.scheduler import RunCounters, _publish_candidates
 from nowcoder_crawler.worker import handle_message
 
 
@@ -42,6 +43,8 @@ def _settings(tmp_path: Path) -> Settings:
         experience_api_max_pages=20,
         experience_api_interval_seconds=0,
         experience_api_jitter_seconds=0,
+        discovery_queue_maxsize=1000,
+        discovery_db_batch_size=200,
         sitemap_max_documents=20,
         sitemap_max_urls=100,
         sitemap_root_urls=("https://www.nowcoder.com/sitemap.xml",),
@@ -59,15 +62,12 @@ def test_duplicate_discovery_keeps_one_page_and_lineage(database: Database) -> N
         job_level=2,
         source_page=1,
     )
-    with database.session() as session:
-        upsert_discovered_pages(session, _run(database), [item], RunCounters())
-    with database.session() as session:
-        upsert_discovered_pages(
-            session,
-            _run(database),
-            [replace(item, source_page=2)],
-            RunCounters(),
-        )
+    write_discovered_batch(database, _run(database), [item])
+    write_discovered_batch(
+        database,
+        _run(database),
+        [replace(item, source_page=2)],
+    )
 
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(Page)) == 1

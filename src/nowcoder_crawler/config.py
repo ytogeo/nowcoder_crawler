@@ -56,6 +56,8 @@ class Settings:
     experience_api_max_pages: int
     experience_api_interval_seconds: float
     experience_api_jitter_seconds: float
+    discovery_queue_maxsize: int
+    discovery_db_batch_size: int
     sitemap_max_documents: int
     sitemap_max_urls: int
     sitemap_root_urls: tuple[str, ...]
@@ -90,6 +92,8 @@ class Settings:
                 "EXPERIENCE_API_INTERVAL_SECONDS", 2
             ),
             experience_api_jitter_seconds=_float("EXPERIENCE_API_JITTER_SECONDS", 1),
+            discovery_queue_maxsize=_int("DISCOVERY_QUEUE_MAXSIZE", 1_000),
+            discovery_db_batch_size=_int("DISCOVERY_DB_BATCH_SIZE", 200),
             sitemap_max_documents=_int("SITEMAP_MAX_DOCUMENTS", 20),
             sitemap_max_urls=_int("SITEMAP_MAX_URLS", 50_000),
             sitemap_root_urls=roots,
@@ -99,10 +103,11 @@ class Settings:
             settings.worker_prefetch < 1
             or settings.fetch_max_attempts < 1
             or settings.experience_api_max_pages < 1
+            or settings.discovery_queue_maxsize < 1
+            or settings.discovery_db_batch_size < 1
         ):
             raise ValueError(
-                "WORKER_PREFETCH, FETCH_MAX_ATTEMPTS, and EXPERIENCE_API_MAX_PAGES "
-                "must be positive"
+                "worker, experience API, and discovery capacity values must be positive"
             )
         if not roots:
             raise ValueError("SITEMAP_ROOT_URLS must contain at least one URL")

@@ -31,6 +31,8 @@ def settings(tmp_path: Path) -> Settings:
         experience_api_max_pages=20,
         experience_api_interval_seconds=0,
         experience_api_jitter_seconds=0,
+        discovery_queue_maxsize=1000,
+        discovery_db_batch_size=200,
         sitemap_max_documents=20,
         sitemap_max_urls=100,
         sitemap_root_urls=("https://www.nowcoder.com/sitemap.xml",),

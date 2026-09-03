@@ -7,13 +7,12 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 
 import httpx
 
 from nowcoder_crawler.identity import identity_from_experience_record
 
-from . import DiscoveredPage
+from . import DiscoveredPage, retry_after_seconds
 
 EXPERIENCE_LIST_URL = (
     "https://gw-c.nowcoder.com/api/sparta/job-experience/experience/job/list"
@@ -79,21 +78,6 @@ def _optional_int(value: object) -> int | None:
         return None if value is None else int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _retry_after_seconds(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value.strip()))
-    except ValueError:
-        try:
-            when = parsedate_to_datetime(value)
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=UTC)
-            return max(0.0, (when - datetime.now(UTC)).total_seconds())
-        except (TypeError, ValueError, OverflowError):
-            return None
 
 
 def parse_record(record: dict, page_number: int) -> DiscoveredPage | None:
@@ -175,7 +159,7 @@ async def fetch_experience_api_page(
             raise last_error
 
         retry_after = (
-            _retry_after_seconds(response.headers.get("retry-after"))
+            retry_after_seconds(response.headers.get("retry-after"))
             if response is not None and response.status_code == 429
             else None
         )

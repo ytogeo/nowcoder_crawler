@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import random
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -12,7 +15,11 @@ import httpx
 
 from nowcoder_crawler.identity import ALLOWED_HOSTS, identity_from_url, strip_query_and_fragment
 
-from . import DiscoveredPage
+from . import DiscoveredPage, retry_after_seconds
+
+LOGGER = logging.getLogger("nowcoder_crawler.discovery.sitemap")
+MAX_REQUEST_ATTEMPTS = 3
+EMIT_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,9 @@ class SitemapStats:
     documents_seen: int
     urls_seen: int
     accepted_pages: int
+    complete: bool
+    stop_reason: str
+    upstream_exhausted: bool
 
 
 def _local_name(tag: str) -> str:
@@ -97,13 +107,57 @@ def _is_allowed_sitemap(url: str) -> bool:
     )
 
 
+async def _fetch_document(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    last_error: Exception | None = None
+    for attempt_no in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        response: httpx.Response | None = None
+        try:
+            response = await client.get(url)
+            retryable = response.status_code in {408, 429} or response.status_code >= 500
+            if not retryable:
+                response.raise_for_status()
+                return response
+            response.raise_for_status()
+        except httpx.TransportError as exc:
+            last_error = exc
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            if response is None or not (
+                response.status_code in {408, 429} or response.status_code >= 500
+            ):
+                raise
+
+        assert last_error is not None
+        if attempt_no == MAX_REQUEST_ATTEMPTS:
+            raise last_error
+
+        retry_after = (
+            retry_after_seconds(response.headers.get("retry-after"))
+            if response is not None and response.status_code == 429
+            else None
+        )
+        delay = retry_after
+        if delay is None:
+            delay = (2.0 if attempt_no == 1 else 5.0) + random.uniform(0, 1)
+        LOGGER.warning(
+            "sitemap_retry url=%s attempt=%s delay_seconds=%.2f error=%s",
+            url,
+            attempt_no,
+            delay,
+            last_error,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError("unreachable")
+
+
 async def discover_sitemaps(
     client: httpx.AsyncClient,
     *,
     roots: Iterable[str],
     max_documents: int,
     max_urls: int,
-    on_pages: Callable[[list[DiscoveredPage]], Awaitable[int]],
+    on_pages: Callable[[list[DiscoveredPage]], Awaitable[object]],
 ) -> SitemapStats:
     """Sitemap 增量发现器：使用广度优先搜索（BFS）递归下钻解析 sitemap 索引。"""
     queue = deque(strip_query_and_fragment(url) for url in roots)
@@ -112,14 +166,14 @@ async def discover_sitemaps(
     documents_seen = 0
     urls_seen = 0
     accepted = 0
+    url_limit_hit = False
 
     while queue and documents_seen < max_documents and urls_seen < max_urls:
         document_url = queue.popleft()
         if document_url in visited_documents or not _is_allowed_sitemap(document_url):
             continue
         visited_documents.add(document_url)
-        response = await client.get(document_url)
-        response.raise_for_status()
+        response = await _fetch_document(client, document_url)
         documents_seen += 1
         entries = parse_document(
             response.content, response.headers.get("content-type", ""), document_url
@@ -127,6 +181,7 @@ async def discover_sitemaps(
         batch: list[DiscoveredPage] = []
         for location, lastmod in entries:
             if urls_seen >= max_urls:
+                url_limit_hit = True
                 break
             absolute = strip_query_and_fragment(urljoin(document_url, location))
             urls_seen += 1
@@ -144,6 +199,10 @@ async def discover_sitemaps(
                             source_modified_at=lastmod,
                         )
                     )
+                    if len(batch) >= EMIT_BATCH_SIZE:
+                        accepted += len(batch)
+                        await on_pages(batch)
+                        batch = []
                 continue
             # 2. 若是子 sitemap 则加入待遍历队列
             if _is_allowed_sitemap(absolute) and absolute not in visited_documents:
@@ -152,4 +211,14 @@ async def discover_sitemaps(
         if batch:
             accepted += len(batch)
             await on_pages(batch)
-    return SitemapStats(documents_seen, urls_seen, accepted)
+    if url_limit_hit or (urls_seen >= max_urls and queue):
+        return SitemapStats(
+            documents_seen, urls_seen, accepted, False, "max_urls", False
+        )
+    if queue:
+        return SitemapStats(
+            documents_seen, urls_seen, accepted, False, "max_documents", False
+        )
+    return SitemapStats(
+        documents_seen, urls_seen, accepted, True, "queue_exhausted", True
+    )
