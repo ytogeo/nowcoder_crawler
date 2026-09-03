@@ -1,7 +1,7 @@
 from nowcoder_crawler.identity import (
     build_identity,
     canonicalize_url,
-    identity_from_center_record,
+    identity_from_experience_record,
     identity_from_url,
 )
 
@@ -27,8 +27,10 @@ def test_rejects_unrelated_page() -> None:
     assert identity_from_url("https://example.com/discuss/123") is None
 
 
-def test_center_record_identity() -> None:
+def test_experience_record_identity() -> None:
     feed = {"contentType": 74, "momentData": {"uuid": "a" * 32}}
     discussion = {"contentType": 250, "contentId": "123456"}
-    assert identity_from_center_record(feed) == build_identity("feed", "a" * 32)
-    assert identity_from_center_record(discussion) == build_identity("discussion", "123456")
+    assert identity_from_experience_record(feed) == build_identity("feed", "a" * 32)
+    assert identity_from_experience_record(discussion) == build_identity(
+        "discussion", "123456"
+    )

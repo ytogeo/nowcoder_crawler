@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .database import Database
 from .discovery import DiscoveredPage
-from .discovery.center import CenterQuery, discover_center
+from .discovery.experience_api import ExperienceApiDiscoverer
 from .discovery.sitemap import discover_sitemaps
 from .models import CrawlRun, Page, PageSource, utc_now
 from .rabbit import RabbitPublisher
@@ -171,7 +171,7 @@ async def _publish_candidates(
 
 async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pages: int) -> int:
     """调度器主入口：一次性执行发现、Upsert 数据库和发布抓取任务。"""
-    invalid = set(sources) - {"center", "sitemap"}
+    invalid = set(sources) - {"experience-api", "sitemap"}
     if invalid:
         raise ValueError(f"unsupported sources: {sorted(invalid)}")
     database = Database(settings.mysql_dsn)
@@ -193,21 +193,20 @@ async def run_scheduler(settings: Settings, *, sources: tuple[str, ...], max_pag
         )
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             # 2-1. 面经中心 API 增量发现
-            if "center" in sources:
+            if "experience-api" in sources:
 
-                async def on_center_page(page_number: int, pages: list[DiscoveredPage]) -> int:
+                async def on_api_page(page_number: int, pages: list[DiscoveredPage]) -> int:
                     del page_number
                     with database.session() as session:
                         return upsert_discovered_pages(session, run_id, pages, counters)
 
-                center_stats = await discover_center(
+                api_stats = await ExperienceApiDiscoverer(
                     client,
-                    query=CenterQuery(),
                     max_pages=max_pages,
-                    stale_pages=settings.center_stale_pages,
-                    on_page=on_center_page,
-                )
-                counters.center_pages_seen = center_stats.pages_seen
+                    interval_seconds=settings.experience_api_interval_seconds,
+                    jitter_seconds=settings.experience_api_jitter_seconds,
+                ).discover(on_api_page)
+                counters.center_pages_seen = api_stats.pages_seen
 
             # 2-2. Sitemap 递归增量发现
             if "sitemap" in sources:

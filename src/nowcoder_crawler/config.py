@@ -26,6 +26,12 @@ def _float(name: str, default: float) -> float:
     return value
 
 
+def _int_with_legacy(name: str, legacy_name: str, default: int) -> int:
+    if os.getenv(name) is not None:
+        return _int(name, default)
+    return _int(legacy_name, default)
+
+
 def _bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -47,8 +53,9 @@ class Settings:
     fetch_jitter_seconds: float
     retry_after_default_seconds: float
     retry_after_max_seconds: float
-    center_max_pages: int
-    center_stale_pages: int
+    experience_api_max_pages: int
+    experience_api_interval_seconds: float
+    experience_api_jitter_seconds: float
     sitemap_max_documents: int
     sitemap_max_urls: int
     sitemap_root_urls: tuple[str, ...]
@@ -76,15 +83,27 @@ class Settings:
             fetch_jitter_seconds=_float("FETCH_JITTER_SECONDS", 2),
             retry_after_default_seconds=_float("FETCH_RETRY_AFTER_DEFAULT_SECONDS", 60),
             retry_after_max_seconds=_float("FETCH_RETRY_AFTER_MAX_SECONDS", 300),
-            center_max_pages=_int("CENTER_MAX_PAGES", 10),
-            center_stale_pages=_int("CENTER_STALE_PAGES", 3),
+            experience_api_max_pages=_int_with_legacy(
+                "EXPERIENCE_API_MAX_PAGES", "CENTER_MAX_PAGES", 20
+            ),
+            experience_api_interval_seconds=_float(
+                "EXPERIENCE_API_INTERVAL_SECONDS", 2
+            ),
+            experience_api_jitter_seconds=_float("EXPERIENCE_API_JITTER_SECONDS", 1),
             sitemap_max_documents=_int("SITEMAP_MAX_DOCUMENTS", 20),
             sitemap_max_urls=_int("SITEMAP_MAX_URLS", 50_000),
             sitemap_root_urls=roots,
             failpoint_after_success_commit=_bool("FAILPOINT_AFTER_SUCCESS_COMMIT"),
         )
-        if settings.worker_prefetch < 1 or settings.fetch_max_attempts < 1:
-            raise ValueError("WORKER_PREFETCH and FETCH_MAX_ATTEMPTS must be positive")
+        if (
+            settings.worker_prefetch < 1
+            or settings.fetch_max_attempts < 1
+            or settings.experience_api_max_pages < 1
+        ):
+            raise ValueError(
+                "WORKER_PREFETCH, FETCH_MAX_ATTEMPTS, and EXPERIENCE_API_MAX_PAGES "
+                "must be positive"
+            )
         if not roots:
             raise ValueError("SITEMAP_ROOT_URLS must contain at least one URL")
         return settings

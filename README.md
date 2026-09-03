@@ -23,7 +23,7 @@ $env:RAW_DATA_DIR = (Resolve-Path './data/raw').Path
 运行一次发现：
 
 ```powershell
-uv run nowcoder-crawler scheduler --sources center sitemap --max-pages 10
+uv run nowcoder-crawler scheduler --sources experience-api sitemap --max-pages 20
 ```
 
 两个终端分别启动 Worker：

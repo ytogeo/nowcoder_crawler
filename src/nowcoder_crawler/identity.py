@@ -56,7 +56,7 @@ def strip_query_and_fragment(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def identity_from_center_record(record: dict) -> PageIdentity | None:
+def identity_from_experience_record(record: dict) -> PageIdentity | None:
     content_type = record.get("contentType")
     if content_type == 74:
         uuid = (record.get("momentData") or {}).get("uuid")

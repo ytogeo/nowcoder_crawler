@@ -26,8 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler.add_argument(
         "--sources",
         nargs="+",
-        choices=("center", "sitemap"),
-        default=("center", "sitemap"),
+        choices=("experience-api", "sitemap"),
+        default=("experience-api", "sitemap"),
     )
     scheduler.add_argument("--max-pages", type=int)
 
@@ -38,7 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _async_main(args: argparse.Namespace, settings: Settings) -> int:
     if args.command == "scheduler":
-        max_pages = settings.center_max_pages if args.max_pages is None else args.max_pages
+        max_pages = (
+            settings.experience_api_max_pages if args.max_pages is None else args.max_pages
+        )
         if max_pages < 1:
             raise ValueError("--max-pages must be positive")
         await run_scheduler(settings, sources=tuple(args.sources), max_pages=max_pages)
