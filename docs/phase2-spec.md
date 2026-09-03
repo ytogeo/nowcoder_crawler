@@ -8,14 +8,14 @@
 
 Phase 1 已经完成 Scheduler、RabbitMQ、双 Worker、手动 ACK、进程内 retry、MySQL 幂等和 gzip 原始页面保存。Phase 2 不重做这些能力，重点修正 discovery 的语义和执行方式。
 
-本阶段的目标是：在一次运行中，尽可能完整地扫描当前两个 live 来源能够公开给系统的 feed/discussion URL，将发现结果持续写入 MySQL；只有两个来源都完整结束后，才把数据库中的待抓取页面发布给现有 Worker。
+本阶段的目标是：在一次运行中，完整执行两个配置好的 live discovery 范围，将发现的 feed/discussion URL 持续写入 MySQL；只有两个来源都成功完成各自的配置范围后，才把数据库中的待抓取页面发布给现有 Worker。
 
 两个来源是：
 
 - 牛客 sitemap；
 - 牛客面经广泛列表 API。
 
-这里的“完整”只表示扫到这两个来源当次可观察到的边界，不表示牛客历史全量。未被当前 API 和 sitemap 暴露的旧页面，未来可以由 Common Crawl、Wayback 等历史数据源补充，但不属于本系统的 Phase 2。
+这里的“完整”不表示牛客历史全量，也不表示已经穷尽 API 的全部深页。Sitemap 要遍历当次根入口列出的全部文档；Experience API 只扫描配置的前 20 页窗口，或在更早遇到空页、短页时结束。未被这两个配置范围暴露的页面，未来可以由其他查询或历史数据源补充，但不属于本系统的 Phase 2。
 
 Discovery 只确认目标是合法的 feed/discussion 页面，不负责判断帖子内容是否真的是面经。API 是一个面经相关、高相关度但返回窗口有限的发现入口；sitemap 是覆盖范围更广的入口。内容分类和手撕题提取留给后续 NLP 流程。
 
@@ -132,35 +132,33 @@ contentType=74  → 使用 momentData.uuid 生成 feed identity
 contentType=250 → 使用外层 contentId 生成 discussion identity
 ```
 
-不支持的记录类型忽略，不进入数据库和 fingerprint。
+不支持的记录类型忽略，不进入数据库。API 是否继续翻页只取决于原始 `records` 数量和配置页数，不取决于成功解析出的 feed/discussion 数量。
 
-### 5.2 页面 fingerprint
+### 5.2 配置窗口
 
-每个响应页根据解析成功的页面身份生成稳定 fingerprint：
+Experience API 默认扫描第 1–20 页：
 
 ```text
-排序后的唯一 (page_type, external_id) 集合
+page=1, 2, 3, ... EXPERIENCE_API_MAX_PAGES
 ```
 
-fingerprint 只用于判断本次 API 查询是否进入重复分页，不使用响应 body hash，也不查询数据库。当前实测中，接口声明的 `totalPage` 可能明显大于实际可访问窗口，深页可能持续重复最后一个有效页面，因此 `totalPage` 不能作为完成依据。
+Phase 2 不计算页面 fingerprint，也不尝试判断服务端是否开始重复尾页。当前实测中前 20 页可以得到不同结果，而更深分页可能重复；本阶段主动接受固定窗口可能减少返回规模，以换取更简单、清楚的 discovery 行为。
 
-当前页 fingerprint 已在本次查询中出现时：
+`EXPERIENCE_API_MAX_PAGES` 是业务选择的覆盖窗口，不是“已经穷尽上游”的证据。完整请求完配置页数表示本次 API producer 成功完成，但 run report 必须明确记录上游是否已自然结束。
 
-- 将停止原因记为 `repeated_page`；
-- 不再次向 writer 输出该重复页；
-- 将该 API 来源视为已经到达当前可观察窗口的边界。
+接口返回的 `totalPage`、`total` 和 `current` 只写入日志或 run report，不控制翻页。数据库中页面是否已经存在也不参与停止判断。
 
 ### 5.3 停止规则
 
-以下情况属于自然完成：
+以下情况都表示 API producer 成功完成配置范围：
 
 1. `records` 为空，停止原因 `empty_page`；
 2. 当前页非空但小于接口声明的正常 page size，先输出当前页，再以 `short_page` 结束；
-3. 当前页 fingerprint 在本次查询中重复，以 `repeated_page` 结束。
+3. 完整处理 `EXPERIENCE_API_MAX_PAGES`，以 `configured_page_limit` 结束。
 
-`totalPage`、`total` 和 `current` 仅作为日志与 run report 的观测数据，不决定是否停止。数据库中页面是否已经存在也不参与停止判断，Phase 1 的连续三页 stale early-stop 从正式 full scan 路径删除。
+空页或短页意味着 `upstream_exhausted=true`。到达配置页数时仍然 `complete=true`，可以通过 publication barrier，但必须记录 `upstream_exhausted=false`，不能宣称已经扫完 API 的全部可返回内容。
 
-达到 `EXPERIENCE_API_MAX_PAGES` 仍没有出现自然结束信号时，以 `max_pages_reached` 结束，并把 API 来源标记为 incomplete；不能把安全上限误报为完整扫描。
+Phase 1 的连续三页 stale early-stop 从正式 full scan 路径删除。API 只有请求最终失败、响应无效或被阻断时才标记为 incomplete。
 
 ### 5.4 请求节奏与错误
 
@@ -216,7 +214,7 @@ sitemap producer
 来源失败时的行为：
 
 - 某个 producer 失败或 incomplete，不取消另一个 producer；
-- 另一个 producer 继续到自己的自然边界；
+- 另一个 producer 继续完成自己的配置范围；
 - writer 将已经进入队列的数据全部写完；
 - 最终 crawl run 记为 failed，不自动发布。
 
@@ -240,15 +238,35 @@ await asyncio.to_thread(write_batch, batch)
 
 执行同步 SQLAlchemy/PyMySQL 事务。`write_batch()` 必须在线程内部创建并关闭自己的 Session，禁止把 Session 跨线程传递。
 
-批量事务不能简单复用 Phase 1 的逐条 `SELECT page → SELECT page_source`，否则 25,000 条 sitemap URL 会产生大量 N+1 SQL。每批应当：
+批量事务不能简单复用 Phase 1 的逐条 `SELECT page → SELECT page_source`，否则 25,000 条 sitemap URL 会产生大量 N+1 SQL。访问数据库前，writer 必须先在内存中完成批内聚合：
 
-1. 一次批量查询本批涉及的 page identity；
-2. 集中插入缺失的 pages，并取得其 ID；
-3. 一次批量查询相关的 page_sources；
-4. 集中插入或更新 lineage；
+```python
+pages_by_identity = {}
+sources_by_key = {}
+
+for item in batch:
+    page_key = (item.identity.page_type, item.identity.external_id)
+    pages_by_identity[page_key] = merge_page(pages_by_identity.get(page_key), item)
+
+    lineage_key = (page_key, item.source_type, item.source_key)
+    sources_by_key[lineage_key] = merge_source(
+        sources_by_key.get(lineage_key), item
+    )
+```
+
+`merge_page()` 使用 identity 生成的规范 URL，`source_modified_at` 取批内最大值。`merge_source()` 的 `source_modified_at` 取最大值；新 lineage 的 `first_seen_page` 保留批内第一次观察位置，`last_seen_page` 保留批内最后一次观察位置。
+
+聚合后再执行数据库事务：
+
+1. 一次批量查询 `pages_by_identity` 中的唯一 page identity；
+2. 每个缺失 page 只插入一次并 flush，取得 page ID；
+3. 一次批量查询 `sources_by_key` 涉及的已有 page_sources；
+4. 集中插入或更新聚合后的 lineage；
 5. 更新页面的 last_seen、source_modified_at 和必要的 pending 状态；
 6. 在同一事务内 commit；
 7. 返回本批新增、更新和 URL 计数。
+
+同一 identity、同一来源在一个 batch 中出现多次，最终只能产生一条 page 和一条 page_source；同一 identity 分别来自 API 和 sitemap 时，最终产生一条 page 和两条 page_sources。唯一约束是最终保护，不能用触发唯一约束并回滚事务代替正常的批内去重。
 
 单 writer 是进程内的写入串行化手段，不引入分布式锁。数据库唯一约束继续作为最终幂等边界：
 
@@ -300,21 +318,23 @@ Batch 默认 200，不追求越大越好。过大的 batch 会增加单次 SQL�
   "mode": "full-scan",
   "requested": ["experience-api", "sitemap"],
   "config": {
-    "experience_api_max_pages": 100,
+    "experience_api_max_pages": 20,
     "sitemap_max_documents": 20,
     "sitemap_max_urls": 50000
   },
   "results": {
     "experience-api": {
       "complete": true,
-      "stop_reason": "repeated_page",
-      "documents_or_pages_seen": 21,
+      "stop_reason": "configured_page_limit",
+      "upstream_exhausted": false,
+      "documents_or_pages_seen": 20,
       "urls_seen": 400,
       "error": null
     },
     "sitemap": {
       "complete": true,
       "stop_reason": "queue_exhausted",
+      "upstream_exhausted": true,
       "documents_or_pages_seen": 3,
       "urls_seen": 25194,
       "error": null
@@ -323,7 +343,7 @@ Batch 默认 200，不追求越大越好。过大的 batch 会增加单次 SQL�
 }
 ```
 
-示例数字只用于解释字段，不是固定预期。
+示例数字只用于解释字段，不是固定预期。`complete` 表示来源成功完成本次配置范围；`upstream_exhausted` 表示是否观察到了上游自然结束。Experience API 到达 20 页配置窗口时前者为 true、后者为 false，仍然允许自动发布。
 
 `crawl_runs.status` 继续只有：
 
@@ -419,7 +439,7 @@ discover-only
 新增配置：
 
 ```dotenv
-EXPERIENCE_API_MAX_PAGES=100
+EXPERIENCE_API_MAX_PAGES=20
 EXPERIENCE_API_INTERVAL_SECONDS=2
 EXPERIENCE_API_JITTER_SECONDS=1
 DISCOVERY_QUEUE_MAXSIZE=1000
@@ -429,7 +449,7 @@ DISCOVERY_DB_BATCH_SIZE=200
 兼容规则：
 
 - `EXPERIENCE_API_MAX_PAGES` 未设置时，读取旧的 `CENTER_MAX_PAGES`；
-- 两者都未设置时默认 100；
+- 两者都未设置时默认 20；
 - `CENTER_STALE_PAGES` 不再使用，并从 `.env.example` 删除；
 - 现有 Worker 配置完全不变；
 - 现有 sitemap 上限配置继续使用。
@@ -444,7 +464,7 @@ src/nowcoder_crawler/
 ├── rabbit.py                     # 现有 Publisher 和消息协议
 └── discovery/
     ├── __init__.py               # DiscoveredPage 和公共结果类型
-    ├── experience_api.py         # 固定广泛查询、串行翻页、fingerprint
+    ├── experience_api.py         # 固定广泛查询、串行扫描配置窗口
     ├── sitemap.py                # sitemap 递归与 URL 解析
     ├── service.py                # producer、queue、取消、结果汇总
     └── writer.py                 # 单 writer、batch、同步 DB 线程隔离
@@ -458,20 +478,21 @@ src/nowcoder_crawler/
 
 Phase 2 新增或调整的测试覆盖：
 
-1. Experience API 空页自然结束；
+1. Experience API 空页正常结束；
 2. 短页会先输出再结束；
-3. 重复 fingerprint 停止，且重复页不再次输出；
-4. 达到 max pages 时来源 incomplete；
+3. 第 20 页会被处理，到达配置页数时 `complete=true` 且 `upstream_exhausted=false`；
+4. 不支持的记录不输出，但不会改变基于原始 records 数量的翻页行为；
 5. `totalPage` 不会错误截断或延长扫描；
 6. 两个 producer 能同时处于运行状态；
 7. writer 达到 200 条时提交，并在结束时刷新不足一批的数据；
-8. 批量 upsert 不产生逐页面 N+1 查询；
-9. API 与 sitemap 重复发现最终只有一个 page，并保留两个 lineage；
-10. 一个 producer 失败时另一个继续，已有页面落库，但不发布；
-11. writer 失败时取消 producer，并且不发布；
-12. 完整 discovery 后才发布全库 pending/retryable；
-13. publisher 中途失败时 run 失败，之后可用 `publish-pending` 恢复；
-14. Phase 1 的 identity、Worker retry、gzip、ACK/redelivery 和幂等测试继续通过。
+8. 同 identity、同来源的批内重复最终只有一个 page 和一个 page_source；
+9. 同 identity 来自 API 和 sitemap 时只有一个 page，并保留两个 lineage；
+10. 批量 upsert 不产生逐页面 N+1 查询；
+11. 一个 producer 失败时另一个继续，已有页面落库，但不发布；
+12. writer 失败时取消 producer，并且不发布；
+13. 完整 discovery 后才发布全库 pending/retryable；
+14. publisher 中途失败时 run 失败，之后可用 `publish-pending` 恢复；
+15. 未被 Phase 2 明确替代的 Phase 1 identity、Worker retry、gzip、ACK/redelivery 和幂等测试继续通过。
 
 HTTP 测试使用本地 fixture 或 mock transport，不在常规测试中请求真实牛客。MySQL/RabbitMQ 行为继续放在 integration tests；纯停止规则和编排使用单元测试。
 
@@ -487,7 +508,7 @@ uv run nowcoder-crawler scheduler discover-only
 
 检查：
 
-- API 到达空页、短页或重复 fingerprint，而不是因数据库 stale 停止；
+- API 完整处理配置的前 20 页，或在空页、短页时提前结束，而不是因数据库 stale 停止；
 - sitemap 根入口和当次列出的所有子文档已处理；
 - 两个来源都在 `sources_json` 中报告 complete；
 - `crawl_runs.status=success`；
@@ -499,7 +520,7 @@ Phase 2 验收不要求两个低速 Worker 下载全部两万多个页面，也�
 ## 16. Phase 2 验收标准
 
 - 只通过当前匿名广泛 Experience API 和动态 sitemap 发现 feed/discussion；
-- API 不做公司/岗位分区，且串行扫到当次可观察边界；
+- API 不做公司/岗位分区，且串行完成配置的前 20 页窗口；
 - sitemap 从根入口动态递归，不写死当前子文档；
 - 数据库页面新旧不再造成 discovery early-stop；
 - API 与 sitemap 两个 producer 可并发运行；
@@ -511,7 +532,7 @@ Phase 2 验收不要求两个低速 Worker 下载全部两万多个页面，也�
 - 完整 discovery 和 DB commit 后才能发布；
 - `discover-only`、`full-scan`、`publish-pending` 三个入口语义清楚；
 - 继续使用现有四张表、消息协议和 Worker；
-- Phase 1 全部自动测试继续通过；
+- 所有未被 Phase 2 明确替代的 Phase 1 自动测试继续通过；
 - 完成一次真实 `discover-only` 验收并记录结果。
 
 ## 17. Commit plan
@@ -530,9 +551,9 @@ Commit 以可以观察和回退的行为变化为边界，不为了提交数量�
 1. docs: define phase 2 live discovery
    只提交本 spec，不修改实现。
 
-2. feat: scan experience API to its observable boundary
-   重命名代码概念；实现固定广泛查询、fingerprint、自然停止、max-pages
-   incomplete、请求节奏和错误重试；同时提交对应测试和配置。
+2. feat: scan configured experience API window
+   重命名代码概念；实现固定广泛查询、20 页配置窗口、空页/短页停止、
+   请求节奏和错误重试；删除 stale-stop 及其旧测试，同时提交新的行为测试和配置。
 
 3. feat: stream discovery through batched database writer
    加入两个 producer、有界队列、背压、单 writer、to_thread 和批量事务；
