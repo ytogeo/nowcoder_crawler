@@ -1,6 +1,6 @@
 # 牛客公开帖子采集系统 Phase 2 Spec
 
-状态：设计冻结，实现中
+状态：已实现并完成验收（2026-09-03）
 分支：`phase2-live-discovery`
 范围：当前 live 来源的完整发现流程，不做历史回填和正文分类
 
@@ -541,20 +541,33 @@ HTTP 测试使用本地 fixture 或 mock transport，不在常规测试中请求
 
 ### 15.2 真实验收
 
-真实验收执行一次：
+2026-09-03 在本地 compose 的 MySQL 8.0 与 RabbitMQ 3 环境执行：
 
 ```powershell
 uv run nowcoder-crawler scheduler discover-only
 ```
 
-检查：
+本次运行约 2 分 47 秒，实际结果为：
 
-- API 完整处理配置的前 20 页，或在空页、短页时提前结束，而不是因数据库 stale 停止；
-- sitemap 根入口和当次列出的所有子文档已处理；
-- 两个来源都在 `sources_json` 中报告 complete；
-- `crawl_runs.status=success`；
-- pages 数量、feed/discussion 比例和两个来源的 lineage 合理；
-- 队列保持不变，因为使用的是 `discover-only`。
+```text
+crawl_run.status         success
+experience API           20 页，400 个 URL
+API stop_reason          configured_page_limit
+API upstream_exhausted   false
+sitemap                  3 个文档，25,535 个 URL
+sitemap stop_reason      queue_exhausted
+sitemap upstream_exhausted true
+总 observations          25,935
+pages_inserted           25,591
+pages_updated            344
+messages_published       0
+```
+
+验收结束时数据库共有 25,592 条 page，其中 discussion 9,570 条、feed 16,022 条；运行前已有 1 条测试 page，所以本轮新增数与最终总数相差 1。`page_sources` 中本轮产生 400 次 API lineage 观察和 25,535 次 sitemap lineage 观察，两个来源的重叠由 page identity 正常合并。
+
+`sources_json` 中两个来源均为 `complete=true`。API 明确记录只到配置窗口而非上游穷尽；sitemap 明确记录队列自然结束。dispatch 报告为 `enabled=false`、发布数为 0，RabbitMQ `fetch.ready` 验收结束时为 0 ready、0 unacked、0 consumer。
+
+自动化验收使用隔离的 `nowcoder_test` 数据库，`ruff` 通过，完整测试结果为 41 passed。测试覆盖批内去重、两次集合查询、producer 并发与取消、commit 后发布、跨来源只实时发布一次、Publisher 失败后继续入库、来源晚失败不撤回消息，以及 backlog 恢复。
 
 Phase 2 验收不要求两个低速 Worker 下载全部两万多个页面，也不在真实验收中向正式 RabbitMQ 批量灌入任务。完整发布和 Worker 长时间消费可以在验收后由操作员明确启动，不作为本阶段完成门槛。
 
