@@ -85,10 +85,6 @@ def _candidate_rows(database: Database) -> list[tuple[int, str, str | None]]:
 
 async def _publish_backlog(database: Database, dispatch: DispatchState) -> None:
     for page_id, status, error_type in _candidate_rows(database):
-        before = dispatch.backlog_published
-        await dispatch.publish_ids((page_id,), backlog=True)
-        if dispatch.backlog_published == before:
-            return
         if status == "failed" and error_type == "retryable":
             with database.session() as session:
                 page = session.get(Page, page_id)
@@ -98,6 +94,10 @@ async def _publish_backlog(database: Database, dispatch: DispatchState) -> None:
                     and page.last_error_type == "retryable"
                 ):
                     page.status = "pending"
+        before = dispatch.backlog_published
+        await dispatch.publish_ids((page_id,), backlog=True)
+        if dispatch.backlog_published == before:
+            return
 
 
 def _source_report(result: SourceResult) -> dict[str, object]:

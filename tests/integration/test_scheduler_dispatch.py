@@ -12,7 +12,11 @@ from nowcoder_crawler.discovery.service import DiscoveryResult, SourceResult
 from nowcoder_crawler.discovery.writer import DiscoveryWriteStats, write_discovered_batch
 from nowcoder_crawler.identity import build_identity
 from nowcoder_crawler.models import CrawlRun, Page, PageSource
-from nowcoder_crawler.scheduler import run_discover_only, run_full_scan
+from nowcoder_crawler.scheduler import (
+    run_discover_only,
+    run_full_scan,
+    run_publish_pending,
+)
 
 
 def _settings(database: Database, tmp_path: Path) -> Settings:
@@ -46,6 +50,21 @@ def _item(external_id: str, source_type: str, source_key: str) -> DiscoveredPage
         source_type=source_type,
         source_key=source_key,
     )
+
+
+def _retryable_page(database: Database, external_id: str = "1") -> int:
+    with database.session() as session:
+        identity = build_identity("discussion", external_id)
+        page = Page(
+            page_type=identity.page_type,
+            external_id=identity.external_id,
+            canonical_url=identity.canonical_url,
+            status="failed",
+            last_error_type="retryable",
+        )
+        session.add(page)
+        session.flush()
+        return page.id
 
 
 def _result(*, complete: bool = True) -> DiscoveryResult:
@@ -297,3 +316,53 @@ async def test_discover_only_commits_without_connecting_rabbitmq(
         assert page is not None and page.status == "pending"
         assert run is not None and run.status == "success"
         assert run.sources_json["dispatch"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_fast_worker_failure_is_not_overwritten_after_publish(
+    database: Database, monkeypatch, tmp_path: Path
+) -> None:
+    page_id = _retryable_page(database)
+
+    class RefailingPublisher:
+        async def publish_page(self, published_page_id: int) -> None:
+            assert published_page_id == page_id
+            with database.session() as session:
+                page = session.get(Page, page_id)
+                assert page is not None and page.status == "pending"
+                page.status = "failed"
+                page.last_error_type = "retryable"
+
+        async def close(self) -> None:
+            return None
+
+    async def connect(_url: str, _queue_name: str):
+        return RefailingPublisher()
+
+    monkeypatch.setattr(
+        "nowcoder_crawler.scheduler.RabbitPublisher.connect", staticmethod(connect)
+    )
+
+    assert await run_publish_pending(_settings(database, tmp_path)) == 1
+    with database.session() as session:
+        page = session.get(Page, page_id)
+        assert page is not None
+        assert page.status == "failed"
+        assert page.last_error_type == "retryable"
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_leaves_retryable_backlog_pending(
+    database: Database, monkeypatch, tmp_path: Path
+) -> None:
+    page_id = _retryable_page(database)
+    publisher = RecordingPublisher(database, fail=True)
+    _install_publisher(monkeypatch, publisher)
+
+    with pytest.raises(RuntimeError, match="publisher failed"):
+        await run_publish_pending(_settings(database, tmp_path))
+
+    with database.session() as session:
+        page = session.get(Page, page_id)
+        assert page is not None
+        assert page.status == "pending"
