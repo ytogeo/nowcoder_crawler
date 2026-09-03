@@ -1,8 +1,8 @@
 # nowcoder-crawler
 
-一个用于学习采集架构的牛客公开面经增量采集器。Phase 1 只处理 live feed/discussion 原始 HTML，不宣称历史全量，也不做正文解析。
+一个用于学习采集架构的牛客公开帖子增量采集器。系统只处理 live feed/discussion 原始 HTML，不宣称历史全量，也不做正文解析。
 
-设计边界和验收标准见 [Phase 1 Spec](docs/phase1-spec.md)。
+基础抓取链路见 [Phase 1 Spec](docs/phase1-spec.md)，完整 live discovery 设计见 [Phase 2 Spec](docs/phase2-spec.md)。
 
 ## 本地启动
 
@@ -20,10 +20,17 @@ $env:RABBITMQ_URL = 'amqp://guest:guest@127.0.0.1:5672/'
 $env:RAW_DATA_DIR = (Resolve-Path './data/raw').Path
 ```
 
-运行一次发现：
+完整发现并在每批数据库提交后发布：
 
 ```powershell
-uv run nowcoder-crawler scheduler --sources experience-api sitemap --max-pages 20
+uv run nowcoder-crawler scheduler full-scan --sources experience-api sitemap --max-pages 20
+```
+
+只发现并写入数据库，或只恢复待发布积压：
+
+```powershell
+uv run nowcoder-crawler scheduler discover-only
+uv run nowcoder-crawler scheduler publish-pending
 ```
 
 两个终端分别启动 Worker：

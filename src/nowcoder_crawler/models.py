@@ -29,7 +29,7 @@ class CrawlRun(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
-    sources_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    sources_json: Mapped[list[str] | dict[str, object]] = mapped_column(JSON, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     center_pages_seen: Mapped[int] = mapped_column(Integer, default=0)

@@ -14,7 +14,7 @@ from nowcoder_crawler.fetcher import RequestPacer, WorkerFetchState
 from nowcoder_crawler.identity import build_identity
 from nowcoder_crawler.models import CrawlRun, Page, PageSource, utc_now
 from nowcoder_crawler.rabbit import encode_page_message
-from nowcoder_crawler.scheduler import RunCounters, _publish_candidates
+from nowcoder_crawler.scheduler import run_publish_pending
 from nowcoder_crawler.worker import handle_message
 
 
@@ -79,7 +79,9 @@ def test_duplicate_discovery_keeps_one_page_and_lineage(database: Database) -> N
         assert source.last_seen_page == 2
 
 
-async def test_scheduler_only_publishes_pending_and_retryable(database: Database) -> None:
+async def test_scheduler_only_publishes_pending_and_retryable(
+    database: Database, monkeypatch, tmp_path: Path
+) -> None:
     rows = [
         ("1", "pending", None),
         ("2", "failed", "retryable"),
@@ -101,14 +103,28 @@ async def test_scheduler_only_publishes_pending_and_retryable(database: Database
             )
 
     class Publisher:
-        page_ids: list[int] = []
+        def __init__(self) -> None:
+            self.page_ids: list[int] = []
 
         async def publish_page(self, page_id: int) -> None:
             self.page_ids.append(page_id)
 
+        async def close(self) -> None:
+            return None
+
     publisher = Publisher()
-    counters = RunCounters()
-    await _publish_candidates(database, publisher, counters)  # type: ignore[arg-type]
+
+    async def connect(_url: str, _queue_name: str):
+        return publisher
+
+    monkeypatch.setattr(
+        "nowcoder_crawler.scheduler.RabbitPublisher.connect", staticmethod(connect)
+    )
+    settings = replace(
+        _settings(tmp_path),
+        mysql_dsn=database.engine.url.render_as_string(hide_password=False),
+    )
+    published_count = await run_publish_pending(settings)
 
     with database.session() as session:
         published = set(
@@ -118,7 +134,7 @@ async def test_scheduler_only_publishes_pending_and_retryable(database: Database
         assert retryable is not None
         assert retryable.status == "pending"
     assert published == {"1", "2"}
-    assert counters.messages_published == 2
+    assert published_count == 2
 
 
 async def test_success_is_committed_and_gzip_exists_before_ack(
