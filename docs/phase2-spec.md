@@ -1,6 +1,6 @@
 # 牛客公开帖子采集系统 Phase 2 Spec
 
-状态：设计冻结，待实现
+状态：设计冻结，实现中
 分支：`phase2-live-discovery`
 范围：当前 live 来源的完整发现流程，不做历史回填和正文分类
 
@@ -8,7 +8,7 @@
 
 Phase 1 已经完成 Scheduler、RabbitMQ、双 Worker、手动 ACK、进程内 retry、MySQL 幂等和 gzip 原始页面保存。Phase 2 不重做这些能力，重点修正 discovery 的语义和执行方式。
 
-本阶段的目标是：在一次运行中，完整执行两个配置好的 live discovery 范围，将发现的 feed/discussion URL 持续写入 MySQL；只有两个来源都成功完成各自的配置范围后，才把数据库中的待抓取页面发布给现有 Worker。
+本阶段的目标是：在一次运行中，执行两个配置好的 live discovery 范围，将发现的 feed/discussion URL 持续写入 MySQL。每个 discovery batch 在事务提交后立即把本批新产生的待抓取页面发布给现有 Worker，不再等待全部来源结束。
 
 两个来源是：
 
@@ -40,38 +40,43 @@ Phase 2 不实现：
 ## 3. 总体架构
 
 ```text
-                         SchedulerWorkflow
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-          ExperienceApiDiscoverer     SitemapDiscoverer
-             同一查询串行翻页           sitemap 文档串行
-                    │                         │
-                    └──── DiscoveredPage ────┘
-                                 │
-                    asyncio.Queue(maxsize=1000)
-                                 │
-                         DiscoveryWriter
-                       最多 200 条组成一批
-                                 │
-                    asyncio.to_thread(write_batch)
-                                 │
-                  MySQL pages / page_sources
-                                 │
-                  discovery completion barrier
-                                 │
-                    查询全库 pending/retryable
-                                 │
-                 RabbitMQ fetch.ready → 原有 Worker
+                              SchedulerWorkflow
+                                      │
+                 full-scan 启动时发布已有 pending/retryable
+                                      │
+                         ┌────────────┴────────────┐
+                         │                         │
+               ExperienceApiDiscoverer     SitemapDiscoverer
+                  同一查询串行翻页           sitemap 文档串行
+                         │                         │
+                         └──── DiscoveredPage ────┘
+                                      │
+                         asyncio.Queue(maxsize=1000)
+                                      │
+                              DiscoveryWriter
+                            批内聚合，最多 200 条
+                                      │
+                         asyncio.to_thread(write_batch)
+                                      │
+                       MySQL commit pages / page_sources
+                                      │
+                 CommittedBatchResult(dispatchable_page_ids)
+                                      │
+                         Scheduler / DiscoveryService
+                                      │
+                              RabbitPublisher
+                                      │
+                      RabbitMQ fetch.ready → 原有 Worker
 ```
 
 职责边界：
 
 - `ExperienceApiDiscoverer` 只处理广泛列表 API 的请求、解析、翻页和停止判断；
 - `SitemapDiscoverer` 只处理 sitemap 入口递归和 URL 解析；
-- `DiscoveryService` 负责两个 producer 的并发、队列生命周期、取消和结果汇总；
-- `DiscoveryWriter` 是 discovery 唯一的 MySQL 写入出口，负责批量事务和计数；
-- `SchedulerWorkflow` 只编排 discovery、barrier 和 publish，不包含具体翻页或 SQL；
+- `DiscoveryService` 负责两个 producer 的并发、队列生命周期、取消、已提交 batch 的分发和结果汇总；
+- `DiscoveryWriter` 是 discovery 唯一的 MySQL 写入出口，负责批量事务和计数，并在 commit 成功后返回 `CommittedBatchResult`；
+- `DiscoveryWriter` 和数据库层不导入、不持有也不调用 RabbitMQ Publisher；
+- `SchedulerWorkflow` 只编排 backlog publish、discovery 和实时 post-commit dispatch，不包含具体翻页或 SQL；
 - `RabbitPublisher` 和 Worker 继续沿用 Phase 1 行为。
 
 ## 4. 统一发现对象
@@ -156,7 +161,7 @@ Phase 2 不计算页面 fingerprint，也不尝试判断服务端是否开始重
 2. 当前页非空但小于接口声明的正常 page size，先输出当前页，再以 `short_page` 结束；
 3. 完整处理 `EXPERIENCE_API_MAX_PAGES`，以 `configured_page_limit` 结束。
 
-空页或短页意味着 `upstream_exhausted=true`。到达配置页数时仍然 `complete=true`，可以通过 publication barrier，但必须记录 `upstream_exhausted=false`，不能宣称已经扫完 API 的全部可返回内容。
+空页或短页意味着 `upstream_exhausted=true`。到达配置页数时仍然 `complete=true`，但必须记录 `upstream_exhausted=false`，不能宣称已经扫完 API 的全部可返回内容。
 
 Phase 1 的连续三页 stale early-stop 从正式 full scan 路径删除。API 只有请求最终失败、响应无效或被阻断时才标记为 incomplete。
 
@@ -216,14 +221,19 @@ sitemap producer
 - 某个 producer 失败或 incomplete，不取消另一个 producer；
 - 另一个 producer 继续完成自己的配置范围；
 - writer 将已经进入队列的数据全部写完；
-- 最终 crawl run 记为 failed，不自动发布。
+- 此前已经 commit 和发布的页面不撤回；
+- 后续成功 batch 仍然 commit；Publisher 健康时仍按 post-commit 规则发布；
+- 最终 crawl run 记为 failed，并在 `sources_json` 中记录每个来源的具体结果。
+
+Publisher 失败时不取消 producer，也不停止 writer。Service 记录首次发布错误，并停止本轮后续的实时发布；后面的 discovery 结果继续写入数据库并保持 pending，最终 crawl run 记为 failed。遗留页面由之后的 `publish-pending` 恢复。
 
 Writer 失败时的行为不同：
 
 - writer 是唯一持久化出口，失败属于系统性故障；
 - 立即取消仍在运行的 producer；
 - 不再继续请求牛客；
-- crawl run 记为 failed，不发布；
+- crawl run 记为 failed；
+- 此前已经 commit 或发布的 batch 不撤回；
 - 已 commit 的 batch 保留，未提交内容由下次 full scan 重新发现。
 
 Service 必须在所有 producer 结束后通知 writer 刷新最后不足一个 batch 的对象，并等待 writer 正常退出。不得因为 producer 提前失败而遗留未消费队列。
@@ -264,7 +274,22 @@ for item in batch:
 4. 集中插入或更新聚合后的 lineage；
 5. 更新页面的 last_seen、source_modified_at 和必要的 pending 状态；
 6. 在同一事务内 commit；
-7. 返回本批新增、更新和 URL 计数。
+7. commit 成功后返回本批新增、更新、URL 计数和 `dispatchable_page_ids`。
+
+`CommittedBatchResult` 只能在事务成功提交后产生。它至少包含本批统计和去重后的 `dispatchable_page_ids`；Service 收到结果后才可以调用 Publisher。Writer 不等待 RabbitMQ，也不根据发布结果修改数据库。
+
+`dispatchable_page_ids` 只包括：
+
+- 本批新建且状态为 pending 的页面；
+- 原 success 页面因为明确更新证据而转回 pending 的页面。
+
+以下页面不进入本批 `dispatchable_page_ids`：
+
+- 本来已经是 pending、又被同一或另一来源命中的页面；
+- 已经是 failed/retryable 的 backlog；
+- failed/permanent、failed/blocked 或未发生明确更新的 success 页面。
+
+failed/retryable 仍由 `full-scan` 启动时的 backlog publish 或独立 `publish-pending` 处理。这样，API 与 sitemap 在正常运行中先后发现同一页面时，只会在首次创建 pending 页面时实时发布一次，第二次发现只补充 lineage。
 
 同一 identity、同一来源在一个 batch 中出现多次，最终只能产生一条 page 和一条 page_source；同一 identity 分别来自 API 和 sitemap 时，最终产生一条 page 和两条 page_sources。唯一约束是最终保护，不能用触发唯一约束并回滚事务代替正常的批内去重。
 
@@ -284,19 +309,19 @@ Batch 默认 200，不追求越大越好。过大的 batch 会增加单次 SQL�
 
 ```text
 新页面
-→ pending
+→ pending，并进入本批 dispatchable_page_ids
 
 已有 pending
-→ 保持 pending，更新 last_seen 和 lineage
+→ 保持 pending，更新 last_seen 和 lineage，不再次实时发布
 
 已有 failed/retryable
-→ 保持可重新发布
+→ 保持可重新发布，但不进入本批 dispatchable_page_ids
 
 已有 failed/permanent 或 failed/blocked
 → 不自动恢复
 
 已有 success，来源 editTime/lastmod 明确晚于 last_fetched_at
-→ pending
+→ pending，并进入本批 dispatchable_page_ids
 
 已有 success，来源没有更新证据或时间未变
 → 保持 success，只更新 last_seen 和 lineage
@@ -339,6 +364,13 @@ Batch 默认 200，不追求越大越好。过大的 batch 会增加单次 SQL�
       "urls_seen": 25194,
       "error": null
     }
+  },
+  "dispatch": {
+    "enabled": true,
+    "backlog_published": 12,
+    "batch_published": 388,
+    "failed": false,
+    "error": null
   }
 }
 ```
@@ -355,34 +387,38 @@ running / success / failed
 
 - 任一所选来源 incomplete；
 - writer 失败；
-- discovery 完整后 RabbitMQ 发布失败；
+- backlog publish 或任一 post-commit dispatch 失败；
 - Scheduler 自身发生未处理错误。
+
+`crawl_runs.status=failed` 表示本轮至少一个阶段没有完成，不表示本轮没有成功落库或发布任何页面。来源失败、Publisher 失败和 Writer 失败都不能回滚此前已经提交的 batch，也不能撤回已经 confirm 的 RabbitMQ 消息。
 
 保留现有统计列。`center_pages_seen` 继续记录 Experience API 请求页数，它和数据库中的 `center` lineage 一样是 Phase 1 的兼容字段。`sitemap_docs_seen`、`urls_seen`、`pages_inserted`、`pages_updated` 和 `messages_published` 继续更新。
 
-## 11. Publication barrier
+## 11. Post-commit dispatch 与积压恢复
 
-自动发布必须同时满足：
+每个 batch 的固定顺序是：
 
 ```text
-所有所选 producer complete
-AND writer 队列已清空
-AND 最后一个 batch 已 commit
+batch aggregate
+→ MySQL commit
+→ 返回 CommittedBatchResult
+→ Scheduler / DiscoveryService 发布 dispatchable_page_ids
+→ Worker 消费、保存 gzip、更新 MySQL
+→ Worker ACK
 ```
 
-任一来源 incomplete 时，已经写入的页面保留为 pending，但本次命令不自动发布。操作员可以：
+不存在“等所有来源完成后再发布”的全局 barrier。一次来源后续失败，不会撤回另一来源或此前 batch 已经发布的消息。MySQL commit 是发布本批消息的硬前置条件；若进程在 commit 后、publish 前崩溃，页面自然保留为 pending。
 
-- 修复问题后重新执行 discovery；
-- 或明确执行 `publish-pending`，接受使用部分 discovery 结果。
-
-通过 barrier 后，Publisher 查询全库，而不是只查询当前 run：
+`full-scan` 启动时先查询并发布全库已有 backlog：
 
 ```text
 status=pending
 OR status=failed AND last_error_type=retryable
 ```
 
-这样可以恢复以前“数据库已写入、RabbitMQ 尚未发布”留下的积压。permanent/blocked 不发布。
+这一步只处理命令启动前已经存在的积压，随后启动 discovery。先恢复旧 backlog，可以避免本轮刚创建的 pending 页面同时被 backlog 查询和实时 post-commit dispatch 重复选中。failed/retryable 在发布前按 Phase 1 规则恢复为 pending；permanent/blocked 不发布。
+
+如果 backlog publish 或某个 batch 的实时发布失败，Publisher 停止本轮后续实时发布，但 producer 和 Writer 继续。尚未发布及之后新发现的页面保持 pending，等待未来的 `publish-pending` 或下一次 `full-scan` 恢复。`discover-only` 没有 Publisher，因此 committed result 中的页面有意留作 pending，不算发布失败。
 
 RabbitMQ 继续使用单个 `fetch.ready` durable queue、persistent message 和 publisher confirm。消息仍为：
 
@@ -390,16 +426,16 @@ RabbitMQ 继续使用单个 `fetch.ready` durable queue、persistent message 和
 {"schema_version": 1, "page_id": 123}
 ```
 
-Publisher 逐条异步发布并等待 confirm。发布中途出现第一个错误时立即停止，run 记 failed；已经 confirm 的消息不撤回。之后执行 `publish-pending` 可能重复发布已经进入 RabbitMQ 但尚未被 Worker改成 success 的页面，这是 Phase 1 已接受的 at-least-once 行为，由 Worker 幂等吸收。
+Publisher 逐条异步发布并等待 confirm。发布中途出现第一个错误时停止当前发布序列，并禁用本轮后续实时发布；run 记 failed，已经 confirm 的消息不撤回。之后执行 `publish-pending` 可能重复发布已经进入 RabbitMQ 但尚未被 Worker 改成 success 的页面，这是 Phase 1 已接受的 at-least-once 行为，由 Worker 幂等吸收。
 
-Phase 2 不记录逐消息 published 状态，也不增加 outbox。
+Phase 2 不记录逐消息 `published_at`，也不增加 outbox、任务表或 exactly-once 机制。
 
 ## 12. CLI
 
 Scheduler 改为三个明确子命令：
 
 ```powershell
-# 默认运行 experience-api + sitemap，完整成功后发布积压
+# 先恢复已有积压，再运行 experience-api + sitemap；每批 commit 后实时发布
 uv run nowcoder-crawler scheduler full-scan
 
 # 只发现和写库，不连接 RabbitMQ
@@ -415,24 +451,24 @@ uv run nowcoder-crawler scheduler publish-pending
 --sources experience-api sitemap
 ```
 
-Barrier 只针对本次选择的来源；正式的 live full scan 使用默认两个来源。调试时可以只运行一个来源，但日志和 `sources_json.requested` 必须清楚记录实际范围。
+正式的 live full scan 使用默认两个来源。调试时可以只运行一个来源，但日志和 `sources_json.requested` 必须清楚记录实际范围。
 
 `full-scan` 和 `discover-only` 都创建 crawl run：
 
 ```text
 full-scan
 → running
-→ discovery 完整
-→ publish
-→ success
+→ 发布命令启动前已有 backlog
+→ discovery batch commit 后实时 publish
+→ 所选来源、writer 和 Publisher 都完成后 success
 
 discover-only
 → running
-→ discovery 完整且 writer commit
+→ discovery batch 持续 commit，不连接或调用 Publisher
 → success
 ```
 
-`publish-pending` 不创建 crawl run，因为 `crawl_runs` 仍表示一次 discovery 运行。该命令通过标准日志输出候选数、成功发布数和错误；RabbitMQ UI用于观察最终 queue 状态。
+`publish-pending` 不创建 crawl run，因为 `crawl_runs` 仍表示一次 discovery 运行。它不访问牛客，只发布全库 pending 和 failed/retryable；遇到发布错误即停止，通过下次执行继续恢复。该命令通过标准日志输出候选数、成功发布数和错误；RabbitMQ UI 用于观察最终 queue 状态。
 
 ## 13. 配置
 
@@ -488,11 +524,16 @@ Phase 2 新增或调整的测试覆盖：
 8. 同 identity、同来源的批内重复最终只有一个 page 和一个 page_source；
 9. 同 identity 来自 API 和 sitemap 时只有一个 page，并保留两个 lineage；
 10. 批量 upsert 不产生逐页面 N+1 查询；
-11. 一个 producer 失败时另一个继续，已有页面落库，但不发布；
-12. writer 失败时取消 producer，并且不发布；
-13. 完整 discovery 后才发布全库 pending/retryable；
-14. publisher 中途失败时 run 失败，之后可用 `publish-pending` 恢复；
-15. 未被 Phase 2 明确替代的 Phase 1 identity、Worker retry、gzip、ACK/redelivery 和幂等测试继续通过。
+11. MySQL commit 完成后才调用 Publisher；
+12. 同一页面被 API 和 sitemap 重复发现时，正常运行只实时发布一次，并保留两条 lineage；
+13. 一个 producer 后续失败时另一个继续，此前已经 commit 和发布的结果不撤回；
+14. commit 后、publish 前失败会留下 pending；
+15. Publisher 失败会停止后续实时发布，但不阻止后续 discovery 入库；
+16. writer 失败时取消 producer；
+17. `publish-pending` 能恢复 pending 和 failed/retryable 积压，且不发布 permanent/blocked；
+18. 未被 Phase 2 明确替代的 Phase 1 identity、Worker retry、gzip、ACK/redelivery 和幂等测试继续通过。
+
+原先“incomplete discovery 不发布任何消息”和“完整 discovery 后才发布”的 barrier 测试删除，不保留废弃行为来制造兼容性通过。
 
 HTTP 测试使用本地 fixture 或 mock transport，不在常规测试中请求真实牛客。MySQL/RabbitMQ 行为继续放在 integration tests；纯停止规则和编排使用单元测试。
 
@@ -527,9 +568,12 @@ Phase 2 验收不要求两个低速 Worker 下载全部两万多个页面，也�
 - 有界队列能够向 producer 施加背压；
 - 同步 PyMySQL 写入不会直接阻塞 asyncio 事件循环；
 - 单 writer 按 batch 批量查询和写入，不产生逐页面 N+1；
-- 来源失败保留部分结果但 run 失败，且不自动发布；
+- 每个 batch 只能在 MySQL commit 后发布本批 `dispatchable_page_ids`；
+- 新页面和明确更新后转为 pending 的 success 页面会实时发布，已有 pending 的重复发现只补充 lineage；
+- 来源失败保留已提交和已发布结果，另一来源继续，最终 run 失败；
+- Publisher 失败后 discovery 和数据库写入继续，后续结果保持 pending，最终 run 失败；
 - writer 失败会取消 producer；
-- 完整 discovery 和 DB commit 后才能发布；
+- `full-scan` 和 `publish-pending` 能恢复 pending、failed/retryable 积压；
 - `discover-only`、`full-scan`、`publish-pending` 三个入口语义清楚；
 - 继续使用现有四张表、消息协议和 Worker；
 - 所有未被 Phase 2 明确替代的 Phase 1 自动测试继续通过；
@@ -548,24 +592,28 @@ Commit 以可以观察和回退的行为变化为边界，不为了提交数量�
 计划如下：
 
 ```text
-1. docs: define phase 2 live discovery
-   只提交本 spec，不修改实现。
-
-2. feat: scan configured experience API window
+1. feat: scan configured experience API window
    重命名代码概念；实现固定广泛查询、20 页配置窗口、空页/短页停止、
    请求节奏和错误重试；删除 stale-stop 及其旧测试，同时提交新的行为测试和配置。
 
+2. docs: replace discovery barrier with post-commit dispatch
+   只修改本 spec，把全局 publication barrier 替换为 batch commit 后实时发布，
+   并冻结失败、积压恢复、测试和验收语义。
+
 3. feat: stream discovery through batched database writer
    加入两个 producer、有界队列、背压、单 writer、to_thread 和批量事务；
-   同时提交并发、flush、幂等、lineage 和 writer 失败测试。
+   Writer 返回 CommittedBatchResult，但不依赖 RabbitMQ；同时提交并发、flush、
+   幂等、lineage、dispatchable_page_ids 和 writer 失败测试。
 
-4. feat: gate publishing on complete discovery
-   加入三个 Scheduler 子命令、source report、completion barrier、全库积压发布
-   和发布失败恢复；同时提交工作流测试并更新 README。
+4. feat: publish committed discovery batches
+   加入三个 Scheduler 子命令、source report、启动时积压发布和 batch commit 后
+   实时发布；实现 Publisher 失败后继续入库及 publish-pending 恢复，并提交工作流测试。
 
 5. docs: record phase 2 acceptance
    只在自动测试和真实 discover-only 验收完成后记录实际结果。
 ```
+
+更早的 `docs: define phase 2 live discovery` 和 `docs: tighten phase 2 discovery invariants` 已作为设计历史保留，不 amend；以上列表是从第一笔行为 commit 开始的当前执行计划。
 
 如果实现过程中发现上述某个 commit 同时包含两个可以独立观察、独立测试和独立回退的行为，可以在不制造无用中间状态的前提下再拆分。反过来，强相关的实现与测试不得为了增加 commit 数量而分开。
 
@@ -573,7 +621,7 @@ Commit 以可以观察和回退的行为变化为边界，不为了提交数量�
 
 ## 18. 实现顺序
 
-严格按照 Commit plan 推进。完成 spec commit 后先停下来审阅，不自动开始编码。每完成一个后续行为 commit，都应报告：
+严格按照 Commit plan 推进。本次设计修订必须先独立 commit 并完成一致性复核，之后才能继续后续代码实现。每完成一个后续行为 commit，都应报告：
 
 - 该 commit 改变了什么可观察行为；
 - 对应测试证明了什么；
