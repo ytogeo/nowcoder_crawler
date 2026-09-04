@@ -188,7 +188,6 @@ uv run ruff check .
 uv run ruff format .
 ```
 
----
 
 ## 注意事项
 
