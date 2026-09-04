@@ -4,41 +4,6 @@
 
 项目只采集无需登录即可访问的公开页面，不包含 Cookie 管理、验证码绕过、历史网页回填和正文分类。
 
-## 功能特性
-
-- 同时接入面经列表 API 与 sitemap，并统一规范化 feed UUID 和 discussion ID；
-- 使用有界异步队列、单 Writer 和批量事务处理 discovery 数据；
-- `full-scan` 在每批数据完成 MySQL commit 后立即发布，数据库写入失败时不会产生悬空消息；
-- RabbitMQ 使用 durable queue、persistent message、publisher confirm 和手动 ACK；
-- Worker 支持请求节奏控制、临时错误重试和成功消费后的幂等处理；
-- 原始 HTML 通过临时文件和 `os.replace()` 写入固定 gzip 路径；
-- 通过标准日志、MySQL 状态和 RabbitMQ Management UI 观察运行情况。
-
-## 架构
-
-```mermaid
-flowchart LR
-    API[Experience API] --> Discovery[Discovery Service]
-    Sitemap[Sitemap] --> Discovery
-    Discovery --> Queue[Bounded asyncio.Queue]
-    Queue --> Writer[Batch Writer]
-    Writer -->|transaction| MySQL[(MySQL)]
-    MySQL -->|commit succeeds| Result[Committed Batch Result]
-    Result --> Orchestrator[Scheduler / Discovery Service]
-    Orchestrator -->|dispatchable page IDs| Publisher[RabbitMQ Publisher]
-    Publisher --> Rabbit[(fetch.ready)]
-    Rabbit --> W1[Fetch Worker 1]
-    Rabbit --> W2[Fetch Worker 2]
-    W1 --> Raw[(gzip HTML)]
-    W2 --> Raw
-    W1 --> MySQL
-    W2 --> MySQL
-    W1 -->|ACK after file + DB commit| Rabbit
-    W2 -->|ACK after file + DB commit| Rabbit
-```
-
-Scheduler 是一次性任务，不包含常驻定时器。需要持续增量采集时，可由 cron、任务计划程序或其他外部调度系统定期调用。
-
 ## 环境要求
 
 - Python 3.12+
@@ -157,54 +122,6 @@ Worker 只在 gzip 写入成功且 MySQL 状态提交后 ACK。进程在 ACK 前
 
 队列仍有积压时不要反复执行 `publish-pending` 或 `full-scan`，否则 pending 页面会被再次发布。重复消息不会产生重复页面，但会增加无效消费和潜在的重复请求。
 
-## 运行观察
-
-RabbitMQ Management UI：<http://127.0.0.1:15672>
-
-查看队列状态：
-
-```powershell
-docker compose exec -T rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
-```
-
-查看页面和抓取尝试分布：
-
-```powershell
-docker compose exec -T mysql mysql -unowcoder -pnowcoder nowcoder -e "SELECT status,last_error_type,COUNT(*) FROM pages GROUP BY status,last_error_type; SELECT worker_id,outcome,COUNT(*) FROM fetch_attempts GROUP BY worker_id,outcome;"
-```
-
-查看原始文件数量：
-
-```powershell
-Get-ChildItem ./data/raw -Recurse -Filter *.html.gz | Measure-Object
-```
-
-## 测试
-
-单元测试不需要外部服务：
-
-```powershell
-uv run ruff check .
-uv run pytest tests/unit -q
-```
-
-集成测试会重建目标数据库中的表。请创建独立测试库，绝不要把 `TEST_MYSQL_DSN` 指向正在使用的采集数据库：
-
-```powershell
-docker compose exec -T mysql mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS nowcoder_test"
-$env:TEST_MYSQL_DSN = 'mysql+pymysql://root:root@127.0.0.1:3307/nowcoder_test'
-uv run pytest -q
-```
-
-## 项目边界
-
-- discovery 覆盖当前 API 配置窗口与当次 sitemap 暴露的页面，不代表牛客历史全量；
-- 不使用 Common Crawl 或 Wayback Machine 回填历史页面；
-- 不解析正文，也不判断页面是否属于面经或包含手撕题；
-- 不实现登录态维护、验证码识别或访问限制绕过；
-- 不包含跨 Worker 的严格全局限流和 exactly-once 投递。
-
-实现与可靠性约束见 [Phase 1 Spec](docs/phase1-spec.md) 和 [Phase 2 Spec](docs/phase2-spec.md)，实际验收记录见 [Phase 1 验收记录](docs/phase1-acceptance.md) 及 Phase 2 Spec 的验收章节。
 
 ## 使用说明
 
