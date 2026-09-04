@@ -16,7 +16,6 @@ from .models import utc_now
 
 BLOCKED_MARKERS = (
     "访问过于频繁",
-    "安全验证",
     "请登录后继续访问",
     "verifycenter",
 )

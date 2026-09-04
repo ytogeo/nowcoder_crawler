@@ -65,10 +65,30 @@ def test_normal_page_script_mentioning_captcha_is_not_blocked() -> None:
     assert validate_response(response, identity) is None
 
 
+def test_normal_page_discussing_security_validation_is_not_blocked() -> None:
+    identity = build_identity("discussion", "123456")
+    request = httpx.Request("GET", identity.canonical_url)
+    body = (
+        f"<html><title>嵌入式面经</title><main>{identity.external_id}"
+        "功能安全验证与系统测试经验</main></html>"
+    ).encode() + b"x" * 600
+    response = httpx.Response(
+        200,
+        request=request,
+        content=body,
+        headers={"content-type": "text/html; charset=utf-8"},
+    )
+
+    assert validate_response(response, identity) is None
+
+
 def test_explicit_risk_control_template_is_blocked() -> None:
     identity = build_identity("discussion", "123456")
     request = httpx.Request("GET", identity.canonical_url)
-    body = f"<html><title>安全验证</title>{identity.external_id}</html>".encode() + b"x" * 600
+    body = (
+        f"<html><title>访问过于频繁</title>{identity.external_id}</html>".encode()
+        + b"x" * 600
+    )
     response = httpx.Response(
         200,
         request=request,
