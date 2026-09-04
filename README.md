@@ -4,7 +4,7 @@
 
 系统从 **面经 API** 与 **Sitemap** 发现页面，通过 **MySQL** 记录抓取状态与来源血缘，使用 **RabbitMQ** 进行任务异步分发，并由多个 **Worker** 将页面 HTML 原生原子压缩保存为 `.html.gz` 文件，与后续的正文抽取和数据分析流程彻底解耦。
 
----
+
 
 ## 核心特性
 
@@ -17,7 +17,7 @@
   - **断点自愈**：调度器在数据库事务提交后才向队列发消息，中断时可通过 `publish-pending` 随时恢复。
   - **全局幂等**：依靠数据库唯一约束与前置状态检查，无惧重复消息与重试。
 
----
+
 
 ## 环境要求
 
@@ -25,7 +25,7 @@
 - [uv](https://docs.astral.sh/uv/)（推荐包管理器）
 - Docker & Docker Compose
 
----
+
 
 ## 快速开始
 
@@ -98,7 +98,7 @@ export RAW_DATA_DIR="$(pwd)/data/raw"
 uv run nowcoder-crawler scheduler full-scan
 ```
 
----
+
 
 ## CLI 命令速查
 
@@ -124,7 +124,6 @@ uv run nowcoder-crawler scheduler full-scan --sources experience-api --max-pages
 uv run nowcoder-crawler --verbose scheduler discover-only
 ```
 
----
 
 ## 常用配置项
 
@@ -143,7 +142,7 @@ uv run nowcoder-crawler --verbose scheduler discover-only
 | `EXPERIENCE_API_MAX_PAGES` | `20` | 每轮面经 API 发现的最大翻页深度 |
 | `DISCOVERY_DB_BATCH_SIZE` | `200` | Discovery 批量写库的批次大小 |
 
----
+
 
 ## 数据存储与可靠性
 
@@ -172,7 +171,7 @@ data/raw/
 - **At-Least-Once 与幂等**：Worker 仅在 gzip 写入成功且 MySQL 状态更新提交后才会发送 ACK。即使节点异常退出，RabbitMQ 也会重新投递任务；消费端通过数据库唯一索引与状态检查保证幂等。
 - **断点自愈**：如果 Scheduler 在数据写入数据库后、发送到队列前异常退出，数据仍为 `pending` 状态，后续随时可以通过 `publish-pending` 恢复发布。
 
----
+
 
 ## 开发与测试
 
