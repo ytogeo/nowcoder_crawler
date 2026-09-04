@@ -112,21 +112,19 @@ smoke run 或数据库重建后遗留的 orphan blob。Phase 2 明确不实现 G
 Agent 和软件工程面经频繁使用这个词，单个子串不足以证明页面被拦截。修复只删除该宽泛
 marker，仍保留“访问过于频繁”“请登录后继续访问”和 `verifycenter` 等更明确特征。
 
-## 自动测试与已知限制
+## 自动测试
 
 长跑开始前，隔离的 `nowcoder_test` 数据库完整测试为 43 passed，Ruff 通过。误判修复后，
 Fetcher 相关单元测试为 6 passed，Ruff 通过，并新增“正常正文包含功能安全验证不应 blocked”
 的回归用例。
 
-误判修复后的完整集成测试尚未重跑：验收后 Docker Desktop 因本机
-`dockerInference` 路径错误无法启动，MySQL 测试端口 `127.0.0.1:3307` 不可用。该问题
-发生在完整抓取结束和容器数据核验之后，不影响上述长跑结果，但在合并到 main 前应恢复
-Docker 并重新执行完整测试。
+2026-09-04 恢复 Docker Desktop 后，MySQL 与 RabbitMQ 均为 healthy。使用独立的
+`nowcoder_test` 数据库重新运行完整测试，结果为 44 passed，Ruff 通过。测试过程中未连接
+或重建正式采集数据库 `nowcoder`。
 
 ## 待完成事项
 
-1. Docker Desktop 恢复后，在独立 `nowcoder_test` 数据库运行完整测试；
-2. 将 11 个误判页面恢复为 pending，重新发布并抓取；
-3. 核对 11 个页面全部 success、RabbitMQ 再次归零；
-4. 完成以上三项后，将本报告结论更新为数据批次完全通过。
+1. 将 11 个误判页面恢复为 pending，重新发布并抓取；
+2. 核对 11 个页面全部 success、RabbitMQ 再次归零；
+3. 完成以上两项后，将本报告结论更新为数据批次完全通过。
 
