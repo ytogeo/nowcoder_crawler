@@ -1,6 +1,6 @@
 # nowcoder-crawler
 
-面向牛客公开 `feed` 和 `discussion` 页面的持续增量采集器。项目从面经列表 API 与 sitemap 发现页面，通过 MySQL 持久化采集状态、RabbitMQ 分发任务，并将原始 HTML 原子保存为 gzip 文件，供后续解析、检索或数据分析使用。
+面向牛客公开 `feed` 和 `discussion` 页面的采集系统。项目从面经列表 API 与 sitemap 发现页面，通过 MySQL 持久化采集状态、RabbitMQ 分发任务，并将原始 HTML 原子保存为 gzip 文件，供后续解析、检索或数据分析使用。
 
 ## 环境要求
 
